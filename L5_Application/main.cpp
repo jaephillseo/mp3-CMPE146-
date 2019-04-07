@@ -23,6 +23,228 @@
  * 			@see L0_LowLevel/lpc_sys.h if you wish to override printf/scanf functions.
  *
  */
+
+// MP3 Project
+#include "FreeRTOS.h"
+#include "task.h"
+#include "stdint.h"
+#include "stdio.h"
+#include "queue.h"
+#include "ff.h"
+#include "MP3Driver.hpp"
+#include "uart3.hpp"
+
+MP3Driver mp3;
+Uart3 &lcd = Uart3::getInstance();
+QueueHandle_t mp3Queue;
+QueueHandle_t lcdQueue;
+QueueHandle_t pauseQueue;
+QueueHandle_t cursorQueue;
+char fileName[10][25] = {0};
+char playlist[10][25] = {0};
+int totalFileNumber = 0;
+
+void readFileNamesFromSD()
+{
+    FRESULT status; // File status return structure
+    DIR dir; // Directory structure
+    static FILINFO finfo; // File info structure
+
+    status = f_opendir(&dir, "1:"); // Open directory ("1:" = SD card)
+
+    if (status == FR_OK) // If directory open successfully
+    {
+        while (1)
+        {
+            status = f_readdir(&dir, &finfo); // Read filename and store in file info structure
+
+            if (status != FR_OK || finfo.fname[0] == 0)  // Exit on error or end of directory
+            {
+                break;
+            }
+
+            if (!(finfo.fattrib & AM_DIR)) // If not a sub-directory
+            {
+                sprintf(fileName[totalFileNumber], "1:%s", finfo.fname); // Store "1:" + filename into song name buffer
+                sprintf(playlist[totalFileNumber], "%s", finfo.fname); // Store original filename into play list
+                totalFileNumber++;
+            }
+        }
+
+        f_closedir(&dir); // Close directory
+    }
+}
+
+void readFileTask(void*)
+{
+    int fileNumber = 0;
+    bool playNow = false;
+    bool pause = false;
+
+    while (1)
+    {
+        FIL fil;
+        FRESULT status;
+        uint8_t fileBuffer[512];
+        UINT bytes_read;
+
+        if (FR_OK != (status = f_open(&fil, fileName[fileNumber], FA_OPEN_EXISTING | FA_READ))) // Open file
+        {
+            printf("Error %i: ...\n", status);
+            vTaskDelay(1000);
+            continue;
+        }
+
+        while (FR_OK == f_read(&fil, fileBuffer, 512, &bytes_read)) // As long as we can read the file
+        {
+            // Block forever to put the data into the queue
+            // When the player task is behind, the queue will accumulate data
+            // and we will just end up sleeping here
+            xQueueSend(mp3Queue, &fileBuffer, portMAX_DELAY);
+
+            if (mp3.requestPause() || playNow == false)
+            {
+                if (pause)
+                {
+                    xQueueSend(pauseQueue, &fileNumber, 1000); // Send the file number that is paused to lcd task
+                }
+
+                vTaskDelay(1000);
+
+                while (!mp3.requestPause())
+                {
+                    vTaskDelay(100);
+
+                }
+
+                playNow = true;
+                pause = true;
+
+                if (playNow)
+                {
+                    xQueueSend(lcdQueue, &fileNumber, 1000); // Send the file number that is playing to lcd task
+                }
+
+                vTaskDelay(500);
+            }
+
+            if (mp3.requestBack())
+            {
+                if (fileNumber == 0) // Loop back to last file if this is first file
+                {
+                    fileNumber = totalFileNumber - 1;
+                }
+                else
+                {
+                    fileNumber--;
+                }
+
+                xQueueSend(lcdQueue, &fileNumber, 1000);
+                vTaskDelay(1000);
+                break;
+            }
+
+            if (mp3.requestNext())
+            {
+                if (fileNumber + 1 == totalFileNumber) // Loop back to first file if this is last file
+                {
+                    fileNumber = 0;
+                }
+                else
+                {
+                    fileNumber++;
+                }
+
+                xQueueSend(lcdQueue, &fileNumber, 1000);
+                vTaskDelay(1000);
+                break;
+            }
+
+            if (mp3.requestVolDown())
+            {
+                mp3.decreaseVol();
+                vTaskDelay(100);
+            }
+
+            if (mp3.requestVolUp())
+            {
+                mp3.increaseVol();
+                vTaskDelay(100);
+            }
+
+            if (mp3.selectUp()) // Select song to play in play list (not yet implemented)
+            {
+                vTaskDelay(1000);
+                break;
+            }
+
+            if (mp3.selectdown()) // Select song to play in play list (not yet implemented)
+            {
+                vTaskDelay(1000);
+                break;
+            }
+        }
+
+        f_close(&fil);
+    }
+}
+
+void playMP3Task(void*)
+{
+    uint8_t mp3Buffer[512] = {0};
+
+    while (1)
+    {
+        if (xQueueReceive(mp3Queue, &mp3Buffer, portMAX_DELAY)) // Receive mp3 file 512 bytes at a time
+        {
+            for (int i = 0; i < 512; i+=32)
+            {
+                mp3.waitForDREQ(); // Check DREQ every 32 SDI bytes sent
+
+                mp3.setXDCSLow();
+                for (int j = 0; j < 32; j++)
+                {
+                    mp3.sendSDIByte(mp3Buffer[i+j]); // Send mp3 file 1 byte at a time
+                }
+                mp3.setXDCSHigh();
+            }
+        }
+    }
+}
+
+void resetLCD()
+{
+    lcd.printf("$CLR_SCR\n");
+
+    for (int i = 0; i < 4; i++)
+    {
+        lcd.printf("$L:%i:%s\n", i, playlist[i]);
+    }
+}
+
+void LCDTask(void*)
+{
+    lcd.init(38400);
+    lcd.putChar(0xF0);
+    resetLCD();
+    int count = 0;
+
+    while(1)
+    {
+        if (xQueueReceive(lcdQueue, &count, 1000))
+        {
+            printf("\nReceived data: %i\n", count);
+            resetLCD();
+            lcd.printf("$L:%i:Now Playing:  %s\n", count, playlist[count]);
+        }
+        if (xQueueReceive(pauseQueue, &count, 1000))
+        {
+            resetLCD();
+            lcd.printf("$L:%i:Paused:  %s\n", count, playlist[count]);
+        }
+    }
+}
+
 #include "tasks.hpp"
 #include "examples/examples.hpp"
 
@@ -123,6 +345,19 @@ int main(void)
         u3.init(WIFI_BAUD_RATE, WIFI_RXQ_SIZE, WIFI_TXQ_SIZE);
         scheduler_add_task(new wifiTask(Uart3::getInstance(), PRIORITY_LOW));
     #endif
+
+    const uint32_t STACK_SIZE = 4096/4;
+    mp3Queue = xQueueCreate(2, 512);
+    lcdQueue = xQueueCreate(3, sizeof(int));
+    pauseQueue = xQueueCreate(1, sizeof(int));
+    cursorQueue = xQueueCreate(4, sizeof(int));
+
+    mp3.init();
+    readFileNamesFromSD();
+
+    xTaskCreate(readFileTask, "read", STACK_SIZE, NULL, PRIORITY_HIGH, NULL);
+    xTaskCreate(playMP3Task, "play", STACK_SIZE, NULL, PRIORITY_CRITICAL, NULL);
+    xTaskCreate(LCDTask, "lcd", STACK_SIZE, NULL, PRIORITY_HIGH, NULL);
 
     scheduler_start(); ///< This shouldn't return
     return -1;
